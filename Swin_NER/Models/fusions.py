@@ -1,5 +1,5 @@
 import math
-
+import numpy as np
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -7,6 +7,7 @@ from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 
+# ===============================Original Transformer Encoder===============================
 class AbsolutePositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
@@ -47,6 +48,65 @@ class OriginTransformerEncoder(nn.Module):
         return output
     
 
+# ===============================Tree Transformer Encoder===============================
+class GroupAttention(nn.Module):
+    def __init__(self, d_model, dropout=0.8, use_cuda=True):
+        super(GroupAttention, self).__init__()
+        self.d_model = d_model
+        self.linear_key = nn.Linear(d_model, d_model)
+        self.linear_query = nn.Linear(d_model, d_model)
+        #self.linear_output = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.use_cuda = use_cuda
+
+    def forward(self, context, eos_mask, prior):
+        batch_size,seq_len = context.size()[:2]
+        eos_mask = eos_mask.unsqueeze(1)
+        context =self.norm(context)
+
+        if not self.use_cuda:
+            a = torch.from_numpy(np.diag(np.ones(seq_len - 1, dtype=np.int32),1))
+            b = torch.from_numpy(np.diag(np.ones(seq_len, dtype=np.int32),0))
+            c = torch.from_numpy(np.diag(np.ones(seq_len - 1, dtype=np.int32),-1))
+            tri_matrix = torch.from_numpy(np.triu(np.ones([seq_len,seq_len], dtype=np.float32),0))
+        else:
+            a = torch.from_numpy(np.diag(np.ones(seq_len - 1, dtype=np.int32),1)).cuda()
+            b = torch.from_numpy(np.diag(np.ones(seq_len, dtype=np.int32),0)).cuda()
+            c = torch.from_numpy(np.diag(np.ones(seq_len - 1, dtype=np.int32),-1)).cuda()
+            tri_matrix = torch.from_numpy(np.triu(np.ones([seq_len,seq_len], dtype=np.float32),0)).cuda()
+
+        #mask = eos_mask & (a+c) | b
+        mask = eos_mask & (a+c)
+        
+        key = self.linear_key(context)
+        query = self.linear_query(context)
+        
+        scores = torch.matmul(query, key.transpose(-2, -1)) / self.d_model
+        
+        if eos_mask.dtype == torch.float16:
+            a = a.to(torch.float16)
+            b = b.to(torch.float16)
+            c = c.to(torch.float16)
+            tri_matrix = tri_matrix.to(torch.float16)
+            masking_value = -1e4
+        else:
+            masking_value = -1e9
+
+        scores = scores.masked_fill(mask == 0, masking_value)
+
+        neibor_attn = F.softmax(scores, dim=-1)
+        neibor_attn = torch.sqrt(neibor_attn*neibor_attn.transpose(-2,-1) + 1e-9)
+        neibor_attn = prior + (1. - prior)*neibor_attn
+
+        t = torch.log(neibor_attn + 1e-9).masked_fill(a==0, 0).matmul(tri_matrix)
+        g_attn = tri_matrix.matmul(t).exp().masked_fill((tri_matrix.int()-b)==0, 0)     
+        g_attn = g_attn + g_attn.transpose(-2, -1) + neibor_attn.masked_fill(b==0, 1e-9)
+        
+        return g_attn
+
+
+# ===============================Swin Transformer Encoder===============================
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -82,6 +142,18 @@ def window_partition(x, x_mask, window_size):
     windows = x.contiguous().view(-1, window_size, C)
     x_mask = x_mask.view(-1, window_size)
     return windows, x_mask
+
+
+def attention_partition(attn, window_size):
+    temp = []
+    B, L, L = attn.shape
+    start, end = 0, window_size
+    while end <= L:
+        temp.append(attn[:, start:end, start:end])
+        start += window_size
+        end += window_size
+    temp = torch.stack(temp, 1)
+    return temp.view(-1, window_size, window_size)
 
 
 def window_reverse(windows, window_size, seq_len):
@@ -132,7 +204,7 @@ class WindowAttention(nn.Module):
 
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, group_prob=None):
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
@@ -152,6 +224,8 @@ class WindowAttention(nn.Module):
         else:
             attn = self.softmax(attn)
         attn = torch.nan_to_num(attn)
+        if group_prob is not None:
+            attn = attn * group_prob.unsqueeze(1)
 
         attn = self.attn_drop(attn)
 
@@ -198,16 +272,15 @@ class SwinTransformerBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        ## 3.mask
-        self.attn_mask = None  # TODO
     
-    def sub_forward(self, x, x_mask):
-        B, L, C = x.shape## 这个是B是1，L是seq_len等于3136，C是通道数为96
+    def sub_forward(self, x, x_mask, group_prob=None):
+        B, L, C = x.shape## 这个是B是1，L是seq_len等于3136，C是通道数为96 # TODO:, group_prob
         shortcut = x
         x = self.norm1(x)
 
         # partition windows
         x_windows, x_mask = window_partition(x, x_mask, self.window_size) ## 64 7 7 96  # nW*B, window_size, window_size, C
+        group_prob = attention_partition(group_prob, self.window_size)
 
         x_mask = x_mask.double().unsqueeze(2)
         mask_t = x_mask.permute(0, 2, 1)
@@ -215,7 +288,7 @@ class SwinTransformerBlock(nn.Module):
         attn_mask = 1 - attn_mask
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=attn_mask)## attn_windows 64 49 96，和trm没区别哈，长度49不变，toen维度96没变；  # nW*B, window_size*window_size, C
+        attn_windows = self.attn(x_windows, mask=attn_mask, group_prob=group_prob)## attn_windows 64 49 96，和trm没区别哈，长度49不变，toen维度96没变；  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, C)
@@ -227,8 +300,8 @@ class SwinTransformerBlock(nn.Module):
 
         return x
     
-    def shifted_forward(self, x, x_mask, shift_size):
-        B, L, C = x.shape## 这个是B是1，L是seq_len等于3136，C是通道数为96
+    def shifted_forward(self, x, x_mask, shift_size, group_prob=None):
+        B, L, C = x.shape## 这个是B是1，L是seq_len等于3136，C是通道数为96 # TODO:, group_prob
         shortcut = x
         x = self.norm1(x)
 
@@ -241,6 +314,7 @@ class SwinTransformerBlock(nn.Module):
 
         # partition windows
         x_windows, x_mask = window_partition(x, attn_mask, self.window_size)
+        group_prob = attention_partition(group_prob, self.window_size)
 
         # attn mask
         x_mask = x_mask.masked_fill(x_mask == 0, float('inf'))
@@ -248,7 +322,7 @@ class SwinTransformerBlock(nn.Module):
         attn_mask = attn_mask.masked_fill(attn_mask != 0, 1)
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=attn_mask)## attn_windows 64 49 96，和trm没区别哈，长度49不变，toen维度96没变；  # nW*B, window_size*window_size, C
+        attn_windows = self.attn(x_windows, mask=attn_mask, group_prob=group_prob)## attn_windows 64 49 96，和trm没区别哈，长度49不变，toen维度96没变；  # nW*B, window_size*window_size, C
 
         # reverse windows
         attn_windows = attn_windows.view(-1, self.window_size, C)
@@ -264,21 +338,21 @@ class SwinTransformerBlock(nn.Module):
         return x
         
 
-    def forward(self, x, x_mask):
-        x = self.sub_forward(x, x_mask)
+    def forward(self, x, x_mask, group_prob):
+        x = self.sub_forward(x, x_mask, group_prob)  # TODO: group_prob
 
         if self.shift_size == 'auto':
             shift_size = self.window_size // 2
-            x = self.shifted_forward(x, x_mask, shift_size)
+            x = self.shifted_forward(x, x_mask, shift_size, group_prob)
         elif self.shift_size == 'cycle':
             shift_size = 1
             while 0 < shift_size <= self.window_size // 2:
-                x = self.shifted_forward(x, x_mask, shift_size)
+                x = self.shifted_forward(x, x_mask, shift_size, group_prob)
                 shift_size += 1
         else:
-            x = self.sub_forward(x, x_mask)
+            x = self.sub_forward(x, x_mask, group_prob)
 
-        return x
+        return x, group_prob
 
 
 class SwinTransformerLayer(nn.Module):
@@ -300,7 +374,7 @@ class SwinTransformerLayer(nn.Module):
 
     def __init__(self, seq_len, dim, shift_size, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm):
+                 drop_path=0., norm_layer=nn.LayerNorm, use_cuda=True):
 
         super().__init__()
         self.dim = dim
@@ -316,10 +390,13 @@ class SwinTransformerLayer(nn.Module):
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                                  norm_layer=norm_layer)
             for i in range(depth)])
+        
+        self.group_attn = GroupAttention(dim, use_cuda=use_cuda)
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, group_prob):
+        group_prob = self.group_attn(x, x_mask, group_prob)
         for blk in self.blocks:
-            x = blk(x, x_mask)
+            x = blk(x, x_mask, group_prob)
         return x
 
 
@@ -360,6 +437,7 @@ class SwinTransformer(nn.Module):
         self.seq_len = config.model_args.max_seq_length
         self.dropout = config.dropout
         self.shift_size = config.shift_size
+        self.use_cuda = True if config.accelerator == 'gpu' else False
 
         window_size = [self.seq_len // 2 ** (self.num_layers - 1) * 2**i for i in range(self.num_layers)]
 
@@ -384,7 +462,7 @@ class SwinTransformer(nn.Module):
                                qkv_bias=qkv_bias, qk_scale=qk_scale,
                                drop=self.dropout, attn_drop=attn_drop_rate,
                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                               norm_layer=norm_layer)
+                               norm_layer=norm_layer, use_cuda=self.use_cuda)
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
@@ -406,8 +484,10 @@ class SwinTransformer(nn.Module):
         x = self.pos_encoder(x)
         # x = self.pos_drop(x)
 
+        group_prob = 0.
+
         for layer in self.layers:
-            x = layer(x, x_mask)
+            x, group_prob = layer(x, x_mask, group_prob)
 
         x = self.norm(x)  # B L C
         # x = self.avgpool(x.transpose(1, 2))  # B C 1

@@ -25,7 +25,7 @@ pl.seed_everything(4)
 class Config:
     def __init__(self):
         # controller
-        self.debug = False
+        self.debug = True
         self.preprocess = False
         self.en_train = True
         self.en_inference = False
@@ -36,7 +36,7 @@ class Config:
         self.num_processes = 48 if self.accelerator == 'gpu' else 12
         self.gpus = 4 if self.accelerator == 'gpu' else 1
         self.strategy = 'dp' if (self.accelerator == 'gpu' and self.gpus > 1) else None
-        self.precision = 16 if self.accelerator == 'gpu' else 32
+        self.precision = 32 if self.accelerator == 'gpu' else 32
 
         # utils
         self.log_dir = 'Results/logs/'
