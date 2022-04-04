@@ -11,7 +11,7 @@ from transformers import (
 
 from ner_metrics import *
 from Models.crf import Crf
-from Models.fusions import OriginTransformerEncoder, SwinTransformer
+from Models.fusions import OriginTransformerEncoder, SwinTransformer, SwinTreeTransformer
 
 
 class BertTransformerCrf(nn.Module):
@@ -46,6 +46,22 @@ class BertSwinCrf(nn.Module):
         return output
 
 
+class BertSwinTreeCrf(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.bert = BertModel.from_pretrained(config.plm_name)
+        self.fusion = SwinTreeTransformer(config)
+        self.crf = Crf(config)
+    
+    def forward(self, batch):
+        output = self.bert(batch['input_ids'], batch['attention_mask'])['last_hidden_state']
+        # batch['attention_mask'][:, 0] = 0
+        output = self.fusion(output, batch['attention_mask'])
+        output = self.crf(output, batch['attention_mask'])
+        return output
+
+
 
 class WrapperModel(LightningModule):
     def __init__(self, config):
@@ -55,10 +71,7 @@ class WrapperModel(LightningModule):
         self.label2idx, self.idx2label = config.label2idx, config.idx2label
         self.total_steps = config.total_steps
 
-        if config.model_name == 'Swin':
-            self.model = BertSwinCrf(config)
-        else:
-            self.model = BertTransformerCrf(config)
+        self.model = config.model(config)
         
     def forward(self, batch):
         output = self.model(batch)

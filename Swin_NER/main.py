@@ -1,5 +1,6 @@
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 import sys
 sys.path.append(os.getcwd() + '/Swin_NER')
 
@@ -17,7 +18,7 @@ from transformers import BertTokenizer
 
 from data_process import NERDataModule
 from ner_metrics import *
-from Models.models import WrapperModel
+from Models.models import WrapperModel, BertTransformerCrf, BertSwinCrf, BertSwinTreeCrf
 
 pl.seed_everything(4)
 
@@ -30,11 +31,13 @@ class Config:
         self.en_train = True
         self.en_inference = False
         self.inference_model_path = None
+        self.model = BertSwinCrf
 
         # hardware
         self.accelerator = 'gpu'
         self.num_processes = 48 if self.accelerator == 'gpu' else 12
-        self.gpus = 4 if self.accelerator == 'gpu' else 1
+        self.gpus = 1 if self.accelerator == 'gpu' else 1
+        self.devices = [2] if self.gpus == 1 else self.gpus
         self.strategy = 'dp' if (self.accelerator == 'gpu' and self.gpus > 1) else None
         self.precision = 32 if self.accelerator == 'gpu' else 32
 
@@ -53,7 +56,6 @@ class Config:
         self.label2idx, self.idx2label = None, None
 
         # model
-        self.model_name = 'Swin'
         self.batch_size = 16
         self.total_steps = 0
         self.plm_name = "bert-base-chinese"
@@ -76,6 +78,7 @@ class Config:
             "manual_seed": 4,
             "save_steps": 11898,
             "gradient_accumulation_steps": 1,
+            "early_stopping_patience": 8,
         }
 
         # fit
@@ -97,7 +100,7 @@ if __name__ == '__main__':
     )
 
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_f1",
         mode="min",
         dirpath=config.model_dir,
         filename="swinclue-{epoch:02d}-{val_loss:.2f}",
@@ -110,9 +113,10 @@ if __name__ == '__main__':
         gpus=config.gpus,
         strategy=config.strategy,
         logger=logger,
-        callbacks=[checkpoint_callback, EarlyStopping(monitor="val_loss", patience=config.model_args.early_stopping_patience)],
+        callbacks=[checkpoint_callback, EarlyStopping(monitor="val_f1", patience=config.model_args.early_stopping_patience)],
         precision=config.precision,
-        gradient_clip_val=config.model_args.max_grad_norm
+        gradient_clip_val=config.model_args.max_grad_norm,
+        devices=config.devices
     )
 
     data_module = NERDataModule(config)
