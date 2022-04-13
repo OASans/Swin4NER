@@ -28,7 +28,7 @@ def parse():
     parser = argparse.ArgumentParser(description="swin4ner")    
     parser.add_argument('-batch_size', type=int, default=16, help='batch size')
     parser.add_argument('-gpu_num',type=int,default=0,help='used gpu number')
-    parser.add_argument('-gpu_device',type=str,default='2',help='specify device')
+    parser.add_argument('-gpu_device',type=str,default='1',help='specify device')
     parser.add_argument('-mlp_target',type=str,default='is_entity',help='mlp target')
     args = parser.parse_args()
 

@@ -322,15 +322,38 @@ class SwinMlpTransformerLayer(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio2)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=mlp_out_dim, drop=mlp_drop)
         
-        self.linear = nn.Linear(in_features=dim+mlp_out_dim, out_features=dim)
+        # linear
+        # self.linear = nn.Linear(in_features=dim+mlp_out_dim, out_features=dim)
 
-    def forward(self, x, x_mask, mlp_target):
+        # attention
+        self.d_model = np.sqrt(dim)
+        self.linear_key = nn.Linear(mlp_out_dim, dim)
+        self.linear_query = nn.Linear(dim, dim)
+        self.linear_value = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x, x_mask, mlp_target):  # TODO 
         for blk in self.blocks:
             x = blk(x, x_mask)
         x_mlp = self.mlp(x)
         mlp_loss = self.mlp.cal_loss(x_mlp, mlp_target)
-        x = torch.cat((x, x_mlp), -1)
-        x = self.linear(x)
+
+        # # linear
+        # # x = torch.cat((x, x_mlp), -1)
+        # # x = self.linear(x)
+
+        # # attention
+        # key = self.linear_key(x_mlp)
+        # query = self.linear_query(x)
+        # value = self.linear_value(x)
+        # score = torch.matmul(query, key.transpose(-2, -1)) / self.d_model
+
+        # x_mask = x_mask.unsqueeze(1).expand(score.shape)
+        # score = score.masked_fill(x_mask == 0, -1e9)
+        # score = F.softmax(score, dim=-1)
+        # attn = score @ value
+        # attn = self.proj(attn)
+        # x = x + attn
         return x, mlp_loss
 
 

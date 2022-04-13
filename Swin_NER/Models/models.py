@@ -67,7 +67,6 @@ class BertSwinTreeCrf(nn.Module):
 class BertSwinMlpCrf(nn.Module):
     def __init__(self, config):
         super().__init__()
-
         self.bert = BertModel.from_pretrained(config.plm_name)
         self.fusion = SwinMlpTransformer(config)
         self.crf = Crf(config)
@@ -198,17 +197,36 @@ class WrapperModel(LightningModule):
 
 
 class MlpWrapperModel(WrapperModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.args = config.model_args
+        self.label2idx, self.idx2label = config.label2idx, config.idx2label
+        self.total_steps = config.total_steps
+
+        self.model = config.model(config)
+
+        self.w1 = torch.tensor(0.5, requires_grad=True)
+        self.w2 = torch.tensor(0.5, requires_grad=True)
+    
+    def normed_multi_loss(self, loss_crf, loss_ce):
+        print(self.w1, self.w2)
+        loss = self.w1 * loss_crf + self.w2 * loss_ce - torch.log(self.w1 * self.w2)
+        return loss
+
     def forward(self, batch):
-        output, loss = self.model(batch)
+        output, loss_ce = self.model(batch)
         return output
 
     def training_step(self, batch, batch_idx):
-        output, loss = self.model(batch)
-        loss += self.model.crf.cal_loss(output, batch['y_true_bio'], batch['attention_mask'])
+        output, loss_ce = self.model(batch)
+        loss_crf = self.model.crf.cal_loss(output, batch['y_true_bio'], batch['attention_mask'])
+        loss = self.normed_multi_loss(loss_crf, loss_ce)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        output, val_loss = self.model(batch)
-        val_loss += self.model.crf.cal_loss(output, batch['y_true_bio'], batch['attention_mask'])
-        return {'val_loss': val_loss, 'pred': torch.tensor(output['pred'], device=val_loss.get_device()), 'true': batch['y_true_bio']}
+        output, loss_ce = self.model(batch)
+        loss_crf = self.model.crf.cal_loss(output, batch['y_true_bio'], batch['attention_mask'])
+        loss = self.normed_multi_loss(loss_crf, loss_ce)
+        return {'val_loss': loss, 'pred': torch.tensor(output['pred'], device=loss.get_device()), 'true': batch['y_true_bio']}
