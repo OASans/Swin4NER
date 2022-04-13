@@ -11,7 +11,9 @@ from transformers import (
 
 from ner_metrics import *
 from Models.crf import Crf
-from Models.fusions import OriginTransformerEncoder, SwinTransformer, SwinTreeTransformer
+from Models.fusions_swin import OriginTransformerEncoder, SwinTransformer
+from Models.deprecated_tree import SwinTreeTransformer
+from Models.fusions_swin_mlp import SwinMlpTransformer
 
 
 class BertTransformerCrf(nn.Module):
@@ -61,6 +63,22 @@ class BertSwinTreeCrf(nn.Module):
         output = self.crf(output, batch['attention_mask'])
         return output
 
+
+class BertSwinMlpCrf(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.bert = BertModel.from_pretrained(config.plm_name)
+        self.fusion = SwinMlpTransformer(config)
+        self.crf = Crf(config)
+        self.mlp_target = config.mlp_target
+
+    def forward(self, batch):
+        output = self.bert(batch['input_ids'], batch['attention_mask'])['last_hidden_state']
+        # batch['attention_mask'][:, 0] = 0
+        output, mlp_loss = self.fusion(output, batch['attention_mask'], batch[self.mlp_target])
+        output = self.crf(output, batch['attention_mask'])
+        return output, mlp_loss
 
 
 class WrapperModel(LightningModule):
@@ -178,3 +196,19 @@ class WrapperModel(LightningModule):
         scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
         return [optimizer], [scheduler]
 
+
+class MlpWrapperModel(WrapperModel):
+    def forward(self, batch):
+        output, loss = self.model(batch)
+        return output
+
+    def training_step(self, batch, batch_idx):
+        output, loss = self.model(batch)
+        loss += self.model.crf.cal_loss(output, batch['y_true_bio'], batch['attention_mask'])
+        self.log("train_loss", loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        output, val_loss = self.model(batch)
+        val_loss += self.model.crf.cal_loss(output, batch['y_true_bio'], batch['attention_mask'])
+        return {'val_loss': val_loss, 'pred': torch.tensor(output['pred'], device=val_loss.get_device()), 'true': batch['y_true_bio']}
