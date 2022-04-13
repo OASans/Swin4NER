@@ -28,10 +28,10 @@ def parse():
     parser = argparse.ArgumentParser(description="swin4ner")    
     parser.add_argument('-batch_size', type=int, default=16, help='batch size')
     parser.add_argument('-gpu_num',type=int,default=0,help='used gpu number')
-    parser.add_argument('-gpu_device',type=list,default=['0'],help='specify device')
+    parser.add_argument('-gpu_device',type=str,default='2',help='specify device')
+    parser.add_argument('-mlp_target',type=str,default='is_entity',help='mlp target')
     args = parser.parse_args()
-    
-    args.gpu_device[0] = int(args.gpu_device[0])
+
     return args
 
 def _load_model_args(args):
@@ -73,8 +73,7 @@ if __name__ == '__main__':
             callbacks=[checkpoint_callback, EarlyStopping(monitor="val_f1", patience=config.model_args.early_stopping_patience,
                                                           mode="max")],
             precision=config.precision,
-            gradient_clip_val=config.model_args.max_grad_norm,
-            devices=config.device
+            gradient_clip_val=config.model_args.max_grad_norm
         )
 
         if config.en_train:

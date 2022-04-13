@@ -1,7 +1,9 @@
+import os
 from Models.models import BertTransformerCrf, BertSwinCrf, BertSwinTreeCrf, BertSwinMlpCrf
 
 class Config:
     def __init__(self, args):
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_device
         # controller
         self.debug = False
         self.preprocess = False
@@ -12,13 +14,12 @@ class Config:
         self.model = BertSwinMlpCrf  # BertTransformerCrf, BertSwinCrf, BertSwinTreeCrf, BertSwinMlpCrf
         self.shift_size = 'cycle'  # 'auto', 'cycle', and None
         # swin+mlp
-        self.mlp_target = 'is_entity'  # is_entity, is_edge
+        self.mlp_target = args.mlp_target  # is_entity, is_edge
 
         # hardware
         self.accelerator = 'gpu'
         self.num_processes = 48 if self.accelerator == 'gpu' else 12
         self.gpus = 1 if self.accelerator == 'gpu' and args.gpu_num == 0 else args.gpu_num
-        self.device = args.gpu_device
         self.strategy = 'dp' if (self.accelerator == 'gpu' and self.gpus > 1) else None
         self.precision = 32 if self.accelerator == 'gpu' else 32
 

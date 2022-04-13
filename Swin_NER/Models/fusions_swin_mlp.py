@@ -321,12 +321,16 @@ class SwinMlpTransformerLayer(nn.Module):
 
         mlp_hidden_dim = int(dim * mlp_ratio2)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=mlp_out_dim, drop=mlp_drop)
+        
+        self.linear = nn.Linear(in_features=dim+mlp_out_dim, out_features=dim)
 
     def forward(self, x, x_mask, mlp_target):
         for blk in self.blocks:
             x = blk(x, x_mask)
         x_mlp = self.mlp(x)
         mlp_loss = self.mlp.cal_loss(x_mlp, mlp_target)
+        x = torch.cat((x, x_mlp), -1)
+        x = self.linear(x)
         return x, mlp_loss
 
 
