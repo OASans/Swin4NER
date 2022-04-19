@@ -206,12 +206,13 @@ class MlpWrapperModel(WrapperModel):
 
         self.model = config.model(config)
 
-        self.w1 = torch.tensor(0.5, requires_grad=True)
-        self.w2 = torch.tensor(0.5, requires_grad=True)
+        # self.w1 = torch.tensor(.5, requires_grad=True).float()
+        # self.w2 = torch.tensor(.5, requires_grad=True).float()
     
     def normed_multi_loss(self, loss_crf, loss_ce):
-        print(self.w1, self.w2)
-        loss = self.w1 * loss_crf + self.w2 * loss_ce - torch.log(self.w1 * self.w2)
+        # print(self.w1, self.w2, loss_crf, loss_ce)
+        # loss = self.w1 * loss_crf + self.w2 * loss_ce - torch.log(self.w1 * self.w2)
+        loss = loss_crf + loss_ce
         return loss
 
     def forward(self, batch):
@@ -220,13 +221,13 @@ class MlpWrapperModel(WrapperModel):
 
     def training_step(self, batch, batch_idx):
         output, loss_ce = self.model(batch)
-        loss_crf = self.model.crf.cal_loss(output, batch['y_true_bio'], batch['attention_mask'])
+        loss_crf = self.model.crf.cal_mlp_loss(output, batch['y_true_bio'], batch['attention_mask'])
         loss = self.normed_multi_loss(loss_crf, loss_ce)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         output, loss_ce = self.model(batch)
-        loss_crf = self.model.crf.cal_loss(output, batch['y_true_bio'], batch['attention_mask'])
+        loss_crf = self.model.crf.cal_mlp_loss(output, batch['y_true_bio'], batch['attention_mask'])
         loss = self.normed_multi_loss(loss_crf, loss_ce)
         return {'val_loss': loss, 'pred': torch.tensor(output['pred'], device=loss.get_device()), 'true': batch['y_true_bio']}

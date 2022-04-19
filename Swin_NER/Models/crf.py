@@ -16,6 +16,8 @@ class Crf(nn.Module):
         self.emission_linear = nn.Linear(config.hidden_size, config.num_tags)
         # self.params['other'].extend([p for p in self.emission_linear.parameters()])
 
+        self.register_parameter(name='w1', param=torch.nn.Parameter(torch.tensor(.5, requires_grad=True).float()))
+
     # def get_params(self):
     #     return self.params
 
@@ -23,7 +25,6 @@ class Crf(nn.Module):
         """
         emission: B T L F
         """
-        emission_shape = emission.shape
         result = self.crf.decode(emission, mask)
         result = result.squeeze(dim=0)
         result = result.tolist()
@@ -33,6 +34,11 @@ class Crf(nn.Module):
         emission = self.emission_linear(text_vec)
         return emission
 
+    def cal_mlp_loss(self, preds, y_true, mask):
+        emission = preds['emission']
+        _loss = -self.crf(emission, y_true, mask, reduction='token_mean')
+        return _loss * self.w1 - torch.log(self.w1)
+    
     def cal_loss(self, preds, y_true, mask):
         emission = preds['emission']
         _loss = -self.crf(emission, y_true, mask, reduction='token_mean')

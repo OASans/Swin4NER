@@ -1,6 +1,8 @@
+/Swin_NER/Data_old/
 /Swin_NER/Data/
 /Swin_NER/Results/
-/Swin_NER/*.out
+/Swin_NER/Outs/
+/utils
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

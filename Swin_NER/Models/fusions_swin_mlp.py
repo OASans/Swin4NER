@@ -1,6 +1,7 @@
 import math
 import numpy as np
 import torch
+from functools import reduce
 from torch import nn, Tensor
 import torch.nn.functional as F
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
@@ -32,20 +33,34 @@ class AbsolutePositionalEncoding(nn.Module):
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., ignore_idx=-1):
         super().__init__()
-        self.out_features = out_features or in_features
+        self.out_features = out_features if out_features else in_features
         self.hidden_features = hidden_features or in_features
         self.fc1 = nn.Linear(in_features, self.hidden_features)
         self.act = act_layer()
         self.fc2 = nn.Linear(self.hidden_features, self.out_features)
         self.drop = nn.Dropout(drop)
 
-        self.criterion = nn.CrossEntropyLoss(ignore_index=ignore_idx)
+        # self.criterion = nn.CrossEntropyLoss(ignore_index=ignore_idx, reduction=None)
 
-    def cal_loss(self, output, y_true):
+        self.register_parameter(name='w2', param=torch.nn.Parameter(torch.tensor(.5, requires_grad=True).float()))
+
+    def cal_loss(self, output, y_true, gamma=2):
         y_hat = output.view(-1, self.out_features)
-        y_true = y_true.view(-1)
-        loss = self.criterion(y_hat, y_true)
-        return loss
+
+        # cross entropy
+        # y_true = y_true.view(-1)
+        # loss = self.criterion(y_hat, y_true)
+
+        # focal loss
+        y_true = y_true.view(-1, 1)
+        preds_softmax = F.softmax(y_hat, dim=1)
+        preds_logsoft = torch.log(preds_softmax)
+        preds_softmax = preds_softmax.gather(1, y_true)
+        preds_logsoft = preds_logsoft.gather(1, y_true)
+        loss = -torch.mul(torch.pow((1-preds_softmax), gamma), preds_logsoft)
+        loss = torch.mean(loss)
+
+        return loss * self.w2 - torch.log(self.w2)
 
     def forward(self, x):
         x = self.fc1(x)
@@ -56,7 +71,7 @@ class Mlp(nn.Module):
         return x
 
 
-def window_partition(x, x_mask, window_size):
+def window_partition(x, window_size):
     """
     Args:
         x: (B, L, C)
@@ -65,13 +80,15 @@ def window_partition(x, x_mask, window_size):
     Returns:
         windows: (num_windows*B, window_size, C)
     """
-    B, L, C = x.shape
-    x = x.view(B, L // window_size, window_size, C)
-    x_mask = x_mask.view(B, L // window_size, window_size)
-
-    windows = x.contiguous().view(-1, window_size, C)
-    x_mask = x_mask.view(-1, window_size)
-    return windows, x_mask
+    if len(x.shape) == 3:
+        B, L, C = x.shape
+        x = x.view(B, L // window_size, window_size, C)
+        result = x.contiguous().view(-1, window_size, C)
+    else:
+        B, L = x.shape
+        x = x.view(B, L // window_size, window_size)
+        result = x.contiguous().view(-1, window_size)
+    return result
 
 
 def attention_partition(attn, window_size):
@@ -178,7 +195,7 @@ class SwinTransformerBlock(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
 
-    def __init__(self, seq_len, dim, shift_size, num_heads, window_size=7,
+    def __init__(self, seq_len, dim, shift_size, num_heads, mlp_ratio2, mlp_drop, mlp_out_dim=2, window_size=7,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -201,13 +218,17 @@ class SwinTransformerBlock(nn.Module):
         ## 3.mask
         self.attn_mask = None
 
-    def sub_forward(self, x, x_mask):
+        mlp_hidden_dim2 = int(dim * mlp_ratio2)
+        self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim2, out_features=mlp_out_dim, drop=mlp_drop)
+
+    def sub_forward(self, x, x_mask, mlp_target):
         B, L, C = x.shape## 这个是B是1，L是seq_len等于3136，C是通道数为96
         shortcut = x
         x = self.norm1(x)
 
         # partition windows
-        x_windows, x_mask = window_partition(x, x_mask, self.window_size) ## 64 7 7 96  # nW*B, window_size, window_size, C
+        x_windows = window_partition(x, self.window_size) ## 64 7 7 96  # nW*B, window_size, window_size, C
+        x_mask = window_partition(x_mask, self.window_size) ## 64 7 7 96  # nW*B, window_size, window_size, C
 
         x_mask = x_mask.double().unsqueeze(2)
         mask_t = x_mask.permute(0, 2, 1)
@@ -217,6 +238,14 @@ class SwinTransformerBlock(nn.Module):
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=attn_mask)## attn_windows 64 49 96，和trm没区别哈，长度49不变，toen维度96没变；  # nW*B, window_size*window_size, C
 
+        # MLP
+        x_mlp = torch.mean(attn_windows, dim=1)
+        x_mlp = self.mlp2(x_mlp)
+        mlp_target = window_partition(mlp_target, self.window_size)
+        mlp_target[mlp_target < 0] = 0
+        mlp_target = reduce(lambda x, y: x&y, mlp_target.T)
+        mlp_loss = self.mlp2.cal_loss(x_mlp, mlp_target)
+
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, C)
         x = window_reverse(attn_windows, self.window_size, L)  # B H' W' C
@@ -225,9 +254,9 @@ class SwinTransformerBlock(nn.Module):
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
-        return x
+        return x, mlp_loss
 
-    def shifted_forward(self, x, x_mask, shift_size):
+    def shifted_forward(self, x, x_mask, shift_size, mlp_target):
         B, L, C = x.shape## 这个是B是1，L是seq_len等于3136，C是通道数为96
         shortcut = x
         x = self.norm1(x)
@@ -240,7 +269,8 @@ class SwinTransformerBlock(nn.Module):
         attn_mask = torch.roll(attn_mask, -shift_size, dims=1)
 
         # partition windows
-        x_windows, x_mask = window_partition(x, attn_mask, self.window_size)
+        x_windows = window_partition(x, self.window_size)
+        x_mask = window_partition(attn_mask, self.window_size)
 
         # attn mask
         x_mask = x_mask.masked_fill(x_mask == 0, float('inf'))
@@ -249,6 +279,14 @@ class SwinTransformerBlock(nn.Module):
 
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=attn_mask)## attn_windows 64 49 96，和trm没区别哈，长度49不变，toen维度96没变；  # nW*B, window_size*window_size, C
+
+        # MLP
+        x_mlp = torch.mean(attn_windows, dim=1)
+        x_mlp = self.mlp2(x_mlp)
+        mlp_target = window_partition(mlp_target, self.window_size)
+        mlp_target[mlp_target < 0] = 0
+        mlp_target = reduce(lambda x, y: x&y, mlp_target.T)
+        mlp_loss = self.mlp2.cal_loss(x_mlp, mlp_target)
 
         # reverse windows
         attn_windows = attn_windows.view(-1, self.window_size, C)
@@ -261,27 +299,33 @@ class SwinTransformerBlock(nn.Module):
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
-        return x
+        return x, mlp_loss
 
 
-    def forward(self, x, x_mask):
-        x = self.sub_forward(x, x_mask)
+    def forward(self, x, x_mask, mlp_target):
+        mlp_loss = torch.tensor(0, device=x.device).float()
+        x, loss = self.sub_forward(x, x_mask, mlp_target)
+        mlp_loss += loss
 
         if self.shift_size == 'auto':
             shift_size = self.window_size // 2
-            x = self.shifted_forward(x, x_mask, shift_size)
+            x, loss = self.shifted_forward(x, x_mask, shift_size, mlp_target)
+            mlp_loss += loss
         elif self.shift_size == 'cycle':
             if self.window_size < self.seq_len:
                 shift_size = 1
                 while 0 < shift_size < self.window_size:
-                    x = self.shifted_forward(x, x_mask, shift_size)
+                    x, loss = self.shifted_forward(x, x_mask, shift_size, mlp_target)
+                    mlp_loss += loss
                     shift_size += 1
             else:
-                x = self.sub_forward(x, x_mask)
+                x, loss = self.sub_forward(x, x_mask, mlp_target)
+                mlp_loss += loss
         else:
-            x = self.sub_forward(x, x_mask)
+            x, loss = self.sub_forward(x, x_mask, mlp_target)
+            mlp_loss += loss
 
-        return x
+        return x, mlp_loss
 
 
 class SwinMlpTransformerLayer(nn.Module):
@@ -301,7 +345,7 @@ class SwinMlpTransformerLayer(nn.Module):
     """
 
     def __init__(self, seq_len, dim, shift_size, depth, num_heads, window_size,
-                 mlp_ratio=4., mlp_ratio2=0.5, qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., mlp_drop=0.2,
+                 mlp_ratio=4., mlp_ratio2=0.5, qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., mlp_drop=0,
                 drop_path=0., norm_layer=nn.LayerNorm, mlp_out_dim=2):
 
         super().__init__()
@@ -311,7 +355,8 @@ class SwinMlpTransformerLayer(nn.Module):
         # build blocks
         self.blocks = nn.ModuleList([
             SwinTransformerBlock(seq_len=seq_len, dim=dim, shift_size=shift_size,
-                                 num_heads=num_heads, window_size=window_size,
+                                 num_heads=num_heads, mlp_ratio2=mlp_ratio2, mlp_drop=mlp_drop, mlp_out_dim=mlp_out_dim,
+                                 window_size=window_size,
                                  mlp_ratio=mlp_ratio,
                                  qkv_bias=qkv_bias, qk_scale=qk_scale,
                                  drop=drop, attn_drop=attn_drop,
@@ -319,30 +364,32 @@ class SwinMlpTransformerLayer(nn.Module):
                                  norm_layer=norm_layer)
             for i in range(depth)])
 
-        mlp_hidden_dim = int(dim * mlp_ratio2)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=mlp_out_dim, drop=mlp_drop)
+        # mlp_hidden_dim = int(dim * mlp_ratio2)
+        # self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, out_features=mlp_out_dim, drop=mlp_drop)
         
         # linear
         # self.linear = nn.Linear(in_features=dim+mlp_out_dim, out_features=dim)
 
         # attention
-        self.d_model = np.sqrt(dim)
-        self.linear_key = nn.Linear(mlp_out_dim, dim)
-        self.linear_query = nn.Linear(dim, dim)
-        self.linear_value = nn.Linear(dim, dim)
-        self.proj = nn.Linear(dim, dim)
+        # self.d_model = np.sqrt(dim)
+        # self.linear_key = nn.Linear(mlp_out_dim, dim)
+        # self.linear_query = nn.Linear(dim, dim)
+        # self.linear_value = nn.Linear(dim, dim)
+        # self.proj = nn.Linear(dim, dim)
 
     def forward(self, x, x_mask, mlp_target):  # TODO 
+        mlp_loss = torch.tensor(0, device=x.device).float()
         for blk in self.blocks:
-            x = blk(x, x_mask)
-        x_mlp = self.mlp(x)
-        mlp_loss = self.mlp.cal_loss(x_mlp, mlp_target)
+            x, loss = blk(x, x_mask, mlp_target)
+            mlp_loss += loss
+        # x_mlp = self.mlp(x)
+        # mlp_loss = self.mlp.cal_loss(x_mlp, mlp_target)
 
         # # linear
-        # # x = torch.cat((x, x_mlp), -1)
-        # # x = self.linear(x)
+        # x = torch.cat((x, x_mlp), -1)
+        # x = self.linear(x)
 
-        # # attention
+        # # # attention
         # key = self.linear_key(x_mlp)
         # query = self.linear_query(x)
         # value = self.linear_value(x)
@@ -394,7 +441,11 @@ class SwinMlpTransformer(nn.Module):
         self.dropout = config.dropout
         self.shift_size = config.shift_size
 
-        window_size = [self.seq_len // 2 ** (self.num_layers - 1) * 2**i for i in range(self.num_layers)]
+        window_size = [2, 3, 4, 5, 6, 7] + [self.seq_len // 2 ** (self.num_layers - 1) * 2**i for i in range(self.num_layers)]
+        window_size = [ws for ws in window_size if self.seq_len % ws == 0]
+        self.num_layers = len(window_size)
+        self.depths = [1] * len(window_size)
+        self.num_heads = [3] * (len(window_size) - 4) + [3, 6, 12, 24]
 
         # absolute position embedding
         # self.absolute_pos_embed = nn.Embedding(self.seq_len, self.embed_dim)
@@ -403,22 +454,23 @@ class SwinMlpTransformer(nn.Module):
         # self.pos_drop = nn.Dropout(p=self.dropout)
 
         # stochastic depth
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(self.depths))]  # stochastic depth decay rule
 
         # mlp
         mlp_out_dim = 2 if config.mlp_target == 'is_entity' or config.mlp_target == 'is_edge' else None
+
         # build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = SwinMlpTransformerLayer(seq_len=self.seq_len, dim=self.embed_dim,
                                             shift_size=self.shift_size,
-                                            depth=depths[i_layer],
-                                            num_heads=num_heads[i_layer],
+                                            depth=self.depths[i_layer],
+                                            num_heads=self.num_heads[i_layer],
                                             window_size=window_size[i_layer],
                                             mlp_ratio=self.mlp_ratio,
                                             qkv_bias=qkv_bias, qk_scale=qk_scale,
                                             drop=self.dropout, attn_drop=attn_drop_rate,
-                                            drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                                            drop_path=dpr[sum(self.depths[:i_layer]):sum(self.depths[:i_layer + 1])],
                                             norm_layer=norm_layer, mlp_out_dim=mlp_out_dim)
             self.layers.append(layer)
 

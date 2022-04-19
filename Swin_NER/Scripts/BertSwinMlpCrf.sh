@@ -1,0 +1,1 @@
+nohup python -u main.py -debug 'False' -wrapper_class 'MlpWrapperModel' -model 'BertSwinMlpCrf' -batch_size 16 -gpu_num 1 -gpu_device '0' >> Outs/21entitymlp_swin_transf.out 2>&1 &

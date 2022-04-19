@@ -19,16 +19,19 @@ from transformers import BertTokenizer
 
 from data_process import NERDataModule
 from ner_metrics import *
-from Models.models import WrapperModel, MlpWrapperModel
+
 from config import Config
 
 pl.seed_everything(4)
 
 def parse():
     parser = argparse.ArgumentParser(description="swin4ner")    
-    parser.add_argument('-batch_size', type=int, default=16, help='batch size')
-    parser.add_argument('-gpu_num',type=int,default=0,help='used gpu number')
-    parser.add_argument('-gpu_device',type=str,default='1',help='specify device')
+    parser.add_argument('-debug', type=str, default='True', help='debug mode')
+    parser.add_argument('-wrapper_class', type=str, default='MlpWrapperModel', help='wrapper class')
+    parser.add_argument('-model', type=str, default='BertSwinMlpCrf', help='model class')
+    parser.add_argument('-batch_size', type=int, default=2, help='batch size')
+    parser.add_argument('-gpu_num',type=int,default=1,help='used gpu number')
+    parser.add_argument('-gpu_device',type=str,default='0',help='specify device')
     parser.add_argument('-mlp_target',type=str,default='is_entity',help='mlp target')
     args = parser.parse_args()
 
@@ -44,6 +47,7 @@ if __name__ == '__main__':
     args = parse()
     config = Config(args)
     config.model_args = _load_model_args(config.model_args)
+    print(config)
 
     data_module = NERDataModule(config)
     config.label2idx, config.idx2label = data_module.label2idx, data_module.idx2label
@@ -84,7 +88,7 @@ if __name__ == '__main__':
             config.total_steps = (data_module.train_len // tb_size) * ab_size
             config.model_args.warmup_steps = math.ceil(config.total_steps * config.model_args.warmup_ratio)
 
-            model = MlpWrapperModel(config)
+            model = config.wrapper_class(config)
             trainer.fit(model, data_module)
 
             output_json = {

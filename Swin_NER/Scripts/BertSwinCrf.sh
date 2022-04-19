@@ -1,0 +1,1 @@
+nohup python -u main.py -debug 'False' -wrapper_class 'WrapperModel' -model 'BertSwinCrf' -batch_size 16 -gpu_num 1 -gpu_device '3' >> Outs/20fully_cyclic_swin_apencoding_transf.out 2>&1 &
